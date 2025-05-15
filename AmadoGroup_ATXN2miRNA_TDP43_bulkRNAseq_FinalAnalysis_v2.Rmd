@@ -1,0 +1,1437 @@
+---
+title: "ATXN2 miRNA-mediated KO in a TDP43 Over-Expression Mouse Model Rescues Spinal
+  Cord Transcriptional Dysregulation"
+subtitle: "All samples included"
+author: "Ashley B. Robbins"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: show
+    df_print: paged
+    theme: spacelab
+    highlight: tango
+    toc: yes
+    toc_float:
+      collapsed: yes
+      smooth_scroll: no
+    number_sections: yes
+    fig_retina: yes
+  word_document:
+    toc: yes
+  pdf_document:
+    fig_caption: yes
+    toc: yes
+params:
+  figure_dir: "figures/"
+  data_dir: "data/"
+---
+
+```{r setup, include=FALSE}
+library(rmarkdown)
+library(tinytex)
+library(knitr)
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+# Abstract
+
+# Differential Gene Expression Analysis
+
+## Import packages
+
+```{r import packages, message = FALSE, results = "hide"}
+
+# Package installation optional code:
+if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+packages = c("tximport",
+             "tidyverse",
+             "viridis",
+             "vsn",
+             "dplyr",
+             "readr",
+             "org.Mm.eg.db",
+             "EnsDb.Mmusculus.v79",
+             "DESeq2",
+             "pheatmap",
+             "magrittr",
+             "vsn",
+             "ggplot2",
+             "pheatmap",
+             "RColorBrewer",
+             "PoiClaClu",
+             "glmpca",
+             "apeglm",
+             "gridExtra", 
+             "EnhancedVolcano",
+             "ggpubr", 
+             "DT",
+             "gt", 
+             "clusterProfiler",
+             "forcats",
+             "enrichr")
+
+package.install <- lapply(
+  packages,
+  FUN = function(x) {
+    if (!require(x, character.only = TRUE)) {
+      BiocManager::install(x, force = TRUE)
+      library(x, character.only = TRUE)
+    }
+  }
+)
+```
+
+## Import data and experimental design
+
+### Load sample metadata
+
+```{r load sample metadata, message = FALSE, results = "hide"}
+
+dir = "./" # which directory is this information in? right now it is in the main directory of our R project
+samples <- read.csv(file.path(dir, "exp_design.csv"), header = TRUE) # create a filepath to the metadata file, read in with readr and include the headers so we know what each column is referring to
+# We need to remove duplicate rows
+samples <- as_tibble(samples) 
+samples # check that the information was loaded in correctly
+rownames(samples) <- factor(paste0(samples$Experimental_ID,sep = "_", samples$Genotype,sep = "_",samples$Treatment,sep = "_",samples$Litter)) # change rownames to reflect key experimental information
+
+rownames(samples)
+class(samples) # the metadata is now an R data.frame and tibble object
+# [1] "data.frame"
+
+# Remove miCtrl treated sample from this analysis
+samples <- samples[-c(9),]
+```
+
+### Import abundance files (KALLISTO output)
+
+```{r import abundance files, message = FALSE, results = "hide"}
+
+Tx <- transcripts(EnsDb.Mmusculus.v79, columns = c("tx_id", "gene_name")) # Create a GRanges object with transcript and gene information
+Tx # take a look at this object
+Tx <- as_tibble(Tx)%>% # turn into a "tibble" to use tidyverse and dplyr functions
+  dplyr::select("tx_id", "gene_name" ) #just take the transcript ID and gene name for input into tximport later 
+
+# Define filepath to abundance files
+files <- file.path("KALLISTO", paste0(samples$Sample, "_quant"), "abundance.h5") # create a file path to all abundance.h5 files from your kallisto output
+file.exists(files) # confirm that all files exist
+IDs <- factor(paste0(samples$Experimental_ID,sep = "_", samples$Genotype,sep = "_",samples$Treatment))
+names(files) <- IDs # These must match the rownames of your metadata
+# import Kallisto transcript counts into R using Tximport 
+Txi_gene <- tximport(files, 
+                     type = "kallisto", 
+                     tx2gene = Tx, 
+                     txOut = FALSE, #determines whether your data represented at transcript or gene level
+                     ignoreTxVersion = TRUE)
+
+# Explore the Txi_gene object
+class(Txi_gene) # The Txi_gene object is a list of matrices or arrays
+names(Txi_gene) # Specifically, the list is an output of the counts, abundance, gene lengths and countsFromAbundance 
+head(Txi_gene$counts) # Raw counts from Kallisto by gene
+head(Txi_gene$abundance) # Abundance estimates
+head(Txi_gene$countsFromAbundance) # should be "no" as we did not ask for anything here like "TPM" or "CPM"
+```
+
+## Make DESeq2 DataSet
+
+```{r Make DESeq2 DataSet, message = FALSE, results = "hide"}
+
+# Make sure key variables are set as characters that can be factored
+samples$RNA_batch <- as.character(samples$RNA_batch)
+samples$Litter <- as.character(samples$Litter)
+
+dds <- DESeqDataSetFromTximport(Txi_gene, samples, ~factor(Litter) + factor(RNA_batch) + factor(Genotype) + factor(Treatment)) # import the counts from Txi_gene, the sample metadata and design. 
+#The variable of interest should be last in your design, here being "Genotype". To include an interaction such as Genotype and Age, use a colon. Example:"~Genotype:Age"
+dds
+
+# Our counts matrix has many rows with zero counts or very few total counts. 
+# To reduce the size of the dataset and remove rows that contain little information we can minimally filter the counts matrix 
+# Here we choose to exlude genes with counts < 10 for at least 4 samples (our smallest Treatment)
+nrow(dds) 
+
+# at least 5 samples with a count of 20 or higher
+keep <- rowSums(counts(dds) >= 10)>=5
+dds <- dds[keep,]
+nrow(dds)
+
+```
+
+### Transformation, sample clustering and visualization
+
+```{r transform data, message = FALSE, results = "hide"}
+# variance stabilizing transformation
+vsd <- vst(dds, blind = FALSE)
+meanSdPlot(assay(vsd))
+```
+
+```{r heatmaps of count matrix}
+library("pheatmap")
+dds <- estimateSizeFactors(dds)
+select <- order(rowMeans(counts(dds,normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+df <- as.data.frame(colData(dds)[,c("Genotype", "Treatment", "Litter", "RNA_batch", "Batch")])
+pheatmap(assay(vsd)[select,], cluster_rows=FALSE, show_rownames=FALSE,
+         cluster_cols=TRUE, annotation_col=df)
+
+```
+
+```{r sample-sample distances}
+
+sampleDists <- dist(t(assay(vsd)))
+
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$Treatment, vsd$Genotype, vsd$Litter, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+```
+
+```{r PCA}
+vsd <- vst(dds, blind = FALSE)
+assay(vsd) <- limma::removeBatchEffect(assay(vsd), batch = vsd$Batch, group = vsd$group)
+
+pcaData <- plotPCA(vsd,intgroup=c("Treatment", "Genotype", "Litter", "Sex"),returnData=TRUE, ntop = 2500)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+p1 <- ggplot(pcaData, aes(PC1, PC2, shape = Genotype, color = Treatment)) +
+  geom_point(size=2) +
+  #scale_shape_manual(values=c(19,2))+
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()  + 
+  #scale_color_manual(values = c("#000000","#cf0000"))+
+  theme_bw() +
+  ggtitle("PCA: Genotype ~ Treatment \nVST") 
+p2 <- ggplot(pcaData, aes(PC1, PC2, shape = Genotype, color =Litter)) +
+  geom_point(size=2) +
+  #scale_shape_manual(values=c(19,2))+
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()  + 
+  #scale_color_manual(values = c("#000000","#00bacf"))+
+  theme_bw() +
+  ggtitle("PCA: Genotype ~ Sex \nVST")
+
+g <- grid.arrange(p1, p2, ncol = 2)
+
+```
+
+## Explore Atxn2 levels
+
+```{r Atxn2 levels}
+
+# Save plotcounts to a data frame object
+d <- plotCounts(dds, gene="Atxn2", intgroup=c("Treatment", "Genotype", "Litter"), returnData=TRUE, normalized = TRUE,replaced = TRUE)
+
+d <- d %>%
+  mutate(Group = paste0(Genotype,Treatment))
+# Plotting the MOV10 normalized counts, using the samplenames (rownames of d as labels)
+ggplot(d, aes(x = Group, y = count, color = Litter)) + 
+  geom_point(position=position_jitter(w = 0.1,h = 0), size = 2) +
+  theme_bw() +
+  ggtitle("Atxn2") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+## 
+
+## DESeq2: Differential Gene Expression
+
+### MUT_VSB vs. WT_VSB: Effect of Genotype
+
+We will set the p.adj threshold to 0.05 here to capture the most significant changes by genotype.
+
+```{r DGE mut_vsb vs. wt_vsb}
+
+#Re-level dds object to test genotype_treatment condition
+dds$group <- factor(paste0(dds$Genotype, dds$Treatment))
+dds$group <- relevel(dds$group, ref = "WTVSB")
+
+# Define model matrix
+design(dds) <- ~ factor(Litter) + group
+dds <- DESeq(dds)
+results_MUTVSB_v_WTVSB <- results(dds,contrast = c("group", "MUTVSB", "WTVSB"))
+summary(results_MUTVSB_v_WTVSB, alpha = 0.05)
+results_MUTVSB_v_WTVSB  <- lfcShrink(dds, coef = "group_MUTVSB_vs_WTVSB", type="normal")
+write.csv(results_MUTVSB_v_WTVSB , file=paste0(params$data_dir,"results_MUTVSB_v_WTVSB _allhits.csv"))
+```
+
+#### Manhattan Plot
+
+```{r DGE mut_vsb vs. wt_vsb MA plot}
+
+plotMA(results_MUTVSB_v_WTVSB ,
+       alpha = 0.05,
+       main = "Test: p.adj.value < 0.05", ylim = c(-2.5,2.5))
+```
+
+#### Volcano Plot
+
+```{r DGE mut_vsb vs. wt_vsb Volcano plot}
+
+results_MUTVSB_v_WTVSB <- results_MUTVSB_v_WTVSB %>%
+  as_tibble(rownames = NA)%>% 
+  rownames_to_column("gene")
+
+# Obtain logical vector regarding whether padj values are less than 0.05
+threshold <- results_MUTVSB_v_WTVSB$padj < 0.05
+
+# Add logical vector as a column (threshold) to the res_tableOE
+results_MUTVSB_v_WTVSB$threshold <- threshold
+
+# Create new categorical column ------------------------------------------------
+plot_data <- results_MUTVSB_v_WTVSB %>%
+  mutate(gene_type = case_when(log2FoldChange  >= 0.5 & padj <= 0.05 ~ "up",
+                               log2FoldChange  <= -0.5 & padj <= 0.05 ~ "down",
+                               TRUE ~ "ns"))   
+
+plot_data$padj <- pmax(plot_data$padj,1e-150)
+plot_data$log2FoldChange <- pmin(plot_data$log2FoldChange, 2.5)
+plot_data$log2FoldChange <- pmax(plot_data$log2FoldChange, -2.5)
+# Count gene_type categories ---------------------------------------------------           
+plot_data %>%
+  dplyr::count(gene_type) %>%
+  knitr::kable()
+
+# |gene_type |     n|
+# |:---------|-----:|
+# |down      |   587|
+# |ns        | 15558|
+# |up        |   701|
+  
+# Check gene_type category names -----------------------------------------------
+plot_data %>%
+  distinct(gene_type) %>%
+  pull()
+#> [1] "down" "up"   "ns"    
+
+# Add colour, size, and alpha (transparency) to volcano plot
+cols <- c("up" = "#D22B2B", "down" = "#D22B2B", "ns" = "grey90") 
+sizes <- c("up" = 1.75, "down" = 1.75, "ns" = 1.75) 
+alphas <- c("up" = 0.6, "down" = 0.6, "ns" = 0.4)
+
+library(ggrepel)
+
+pdf(file = paste0(params$figure_dir, "VolcanoPlot_MUTVSB_v_WTVSB_v2.pdf"),   # The directory you want to save the file in
+    width = 4,  # The width of the plot in inches
+    height = 4) # The height of the plot in inches
+plot_data %>%
+  ggplot(aes(x = log2FoldChange, 
+             y = -log10(padj), 
+             color = gene_type, 
+             size = gene_type, 
+             alpha = gene_type)) + 
+  ggrastr::rasterise(geom_point(shape = 19), dpi = 600) + 
+  geom_hline(yintercept = -log10(0.001), linetype = "dashed") + 
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+  scale_color_manual(values = cols) + # Modify point color
+  scale_size_manual(values = sizes) + # Modify point size
+  scale_alpha_manual(values = alphas) + # Modify point transparency
+  scale_x_continuous(breaks = c(seq(-2.0, 2.0, 1)), limits = c(-2, 2.5)) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  ylim(0, 150) 
+dev.off()
+
+```
+
+#### Table of Differentially Expressed Genes
+
+```{r DGE mut_vsb vs. wt_vsb Volcano plot top hits}
+
+# Set adjusted p-value and log2FC threshold
+padj.cutoff <- 0.05
+lfc.cutoff <- 0
+
+# Filter by the adjusted p-value threshold
+sig <- results_MUTVSB_v_WTVSB %>%
+  dplyr::filter(padj < padj.cutoff &abs(log2FoldChange) > lfc.cutoff) 
+
+# Save results table of significant genes
+write.csv(sig, file=paste0(params$data_dir,"results_MUTVSB_v_WTVSB_sighits.csv"))
+
+# Order significant genes by padj
+sig_ordered = sig[order(sig$padj),] 
+rownames(sig_ordered) <- sig_ordered$gene
+
+# Create data table to display differentially expressed genes 
+datatable(sig_ordered, 
+          extensions = c('KeyTable', "FixedHeader"), 
+          caption = 'Differentially Expressed Genes: MUTVSB vs. WTVSB',
+          options = list(keys = TRUE, searchHighlight = TRUE, pageLength = 10, lengthMenu = c("10", "25", "50", "100"))) %>%
+  formatRound(columns=c(1:4), digits=2)
+
+# Save results table of significant genes ordered by significance
+write.csv(sig, file=paste0(params$data_dir,"results_MUTVSB_v_WTVSB_tophits.csv"))
+
+```
+
+#### Heatmap of Top 250 Hits
+
+```{r mut_vsb vs. wt_vsb normalized counts heatmap}
+
+# Pull variance-stabilized counts and correct for litter batch effect
+vsd <- vst(dds, blind = TRUE)
+assay(vsd) <- limma::removeBatchEffect(assay(vsd), batch = vsd$Litter, group = vsd$group)
+vsd_mat <- assay(vsd)
+
+# variance-stabilized counts matrix for top 200 genes
+top250_sig_genes <- sig_ordered %>% 
+        arrange(desc(abs(log2FoldChange)), padj) %>%
+        pull(gene) %>% 		#Extract character vector of ordered genes
+        head(n=250) 	#Extract the first 200 genes
+
+top250_vsd <- vsd_mat[top250_sig_genes,]
+
+### Set annotations
+annotation <- meta %>% 
+  dplyr::select(Group) %>% 
+  data.frame(row.names = IDs) 
+
+annotation_colors <- list(Group = c(WTVSB = "black", MUTV1 = "red", MUTVSB = "blue"))
+
+# All groups
+library(scico)
+
+pdf(file = paste0(params$figure_dir, "Heatplot_MUTVSB_v_WTVSB.pdf"),   # The directory you want to save the file in
+    width = 5, # The width of the plot in inches
+    height = 5) # The height of the plot in inches
+pheatmap(top250_vsd,
+         color = scico(palette = "vik", n = 200),
+         cluster_rows = T,
+         cluster_cols = T,
+         annotation = annotation, 
+         annotation_colors = annotation_colors,
+         border_color = NA, 
+         fontsize = 10, 
+         scale = "row", 
+         height = 20,
+         show_rownames = FALSE,
+         show_colnames = FALSE)
+dev.off()
+
+```
+
+#### GO Term Analysis
+
+```{r mut_vsb vs. wt_vsb GO analysis}
+# Run clusterProfiler
+
+## Create background dataset for hypergeometric testing using all genes tested for significance in the results
+all_genes <- as.character(results_MUTVSB_v_WTVSB$gene)
+
+# Make a gene list object
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+mapping <- AnnotationDbi::select(org.Mm.eg.db, keys=all_genes, columns='ENTREZID', keytype='SYMBOL') %>%
+  mutate(gene = SYMBOL)
+
+results_MUTVSB_v_WTVSB<-merge(results_MUTVSB_v_WTVSB, mapping, by = "gene")
+
+# Set adjusted p-value and log2FC threshold
+padj.cutoff <- 0.05
+lfc.cutoff <- 0.5
+
+# Filter by the adjusted p-value threshold
+sig <- results_MUTVSB_v_WTVSB %>%
+  dplyr::filter(padj < padj.cutoff &abs(log2FoldChange) > lfc.cutoff) %>%
+  distinct(ENTREZID,.keep_all = TRUE) 
+
+# we want the log2 fold change 
+gene_list <- sig$log2FoldChange
+
+# name the vector
+names(gene_list) <- sig$ENTREZID
+
+# omit any NA values 
+gene_list<-na.omit(gene_list)
+
+# sort the list in decreasing order (required for clusterProfiler)
+gene_list = sort(gene_list, decreasing = TRUE)
+
+genes <- names(gene_list)
+
+ekegg <- enrichKEGG(gene = genes,
+               organism     = 'mmu',
+               pvalueCutoff = 0.2)
+
+## Output results from KEGG analysis to a table
+cluster_summary_kegg <- data.frame(ekegg)
+
+y <- mutate(ekegg, richFactor = Count / as.numeric(sub("/\\d+", "", BgRatio)))
+y <- mutate(y, log_padj = -log10(p.adjust))
+y
+
+pdf(file = paste0(params$figure_dir, "KEGGpathway_MUTVSB_v_WTVSB_lollipop.pdf"),   # The directory you want to save the file in
+    width = 5.5, # The width of the plot in inches
+    height = 5) # The height of the plot in inches
+
+plot_data <- y %>%
+  mutate(Term = gsub(" - Mus musculus \\(house mouse\\)", "",Description))%>%
+  filter(nchar(Term) <= 40)
+ggplot(plot_data, showCategory = 15, 
+  aes(Count, fct_reorder(Term, Count))) + 
+  geom_segment(aes(xend=0, yend = Term)) +
+  geom_point(aes(size=log_padj, color = richFactor)) +
+  scale_color_viridis_b(guide=guide_colorbar(reverse=TRUE)) +
+  scale_size_continuous(range=c(4, 8)) +
+  theme_classic() + 
+  xlab("Gene Count") +
+  ylab(NULL) + 
+  ggtitle("Enriched KEGG Pathways")
+dev.off()
+
+
+
+## convert gene ID to Symbol
+ekegg <- setReadable(ekegg, 'org.Mm.eg.db', 'ENTREZID') %>%
+  mutate(Description = gsub(" - Mus musculus \\(house mouse\\)", "",Description)) 
+
+pdf(file = paste0(params$figure_dir, "GOTerm_MUTVSB_v_WTVSB_cnet.pdf"),   # The directory you want to save the file in
+    width = 12, # The width of the plot in inches
+    height = 9) # The height of the plot in inches
+
+ categorys <- c("PI3K-Akt signaling pathway","Amyotrophic lateral sclerosis", "Calcium signaling pathway","Phagosome")
+
+p1 <- cnetplot(ekegg, foldChange=gene_list,
+  showCategory =  categorys)+
+  scico::scale_color_scico(palette = "vik", n = 50)
+
+p1
+dev.off()
+
+
+write.csv(ekegg@result, file = "KEGGTerm_MUTVSB_v_WTVSB.csv")
+
+# Example dataframe
+df <- ekegg@result  # Your dataframe
+
+# Example gene list
+gene_list <- read_csv("data/miAtxn2_NormalizedGeneExpression_table.csv")# Replace with your actual gene list
+gene_list <- gene_list$gene
+
+# Function to find overlaps and count them
+find_overlaps <- function(genes, gene_list) {
+  split_genes <- unlist(strsplit(genes, "/"))
+  overlap_genes <- intersect(split_genes, gene_list)
+  list(count = length(overlap_genes), overlaps = paste(overlap_genes, collapse = ", "))
+}
+
+# Apply the function to each row of the dataframe
+overlap_results <- lapply(df$geneID, find_overlaps, gene_list = gene_list)
+
+# Extract the counts and overlaps
+df$overlap_count <- sapply(overlap_results, function(x) x$count)
+df$overlap_genes <- sapply(overlap_results, function(x) x$overlaps)
+
+# Filter rows that have at least one overlap
+filtered_df <- df[df$overlap_count > 0, ]
+
+# Export the filtered results to a CSV file
+write.csv(filtered_df, "filtered_gene_overlaps.csv", row.names = FALSE)
+
+# View the dataframe
+filtered_df[, c("Description", "overlap_count", "overlap_genes")] %>%
+  arrange(desc(overlap_count))
+
+```
+
+### V1 vs. VSB treatment effect in MUT mice
+
+```{r DGE mut_v1 vs. mut_vsb}
+
+#Re-level dds object to test effect of treatment
+dds$group <- relevel(dds$group, ref = "MUTVSB")
+
+# Define model matrix
+design(dds) <- ~ factor(Litter) + group
+dds <- DESeq(dds)
+results_MUTV1_v_MUTVSB <- results(dds,contrast = c("group", "MUTV1", "MUTVSB"))
+summary(results_MUTV1_v_MUTVSB, alpha = 0.05)
+
+results_MUTV1_v_MUTVSB <- lfcShrink(dds, coef = "group_MUTV1_vs_MUTVSB", type="normal")
+write.csv(results_MUTV1_v_MUTVSB , file=paste0(params$data_dir,"results_MUTV1_v_MUTVSB _allhits.csv"))
+```
+
+#### Manhattan Plot
+
+```{r DGE mut_v1 vs. mut_vsb MA plot}
+
+plotMA(results_MUTV1_v_MUTVSB,
+       alpha = 0.05,
+       main = "Test: p.adj.value < 0.05", ylim = c(-2.5,2.5))
+```
+
+#### Volcano Plot
+
+```{r DGE mut_v1 vs. mut_vsb Volcano plot}
+
+results_MUTV1_v_MUTVSB <- results_MUTV1_v_MUTVSB %>%
+  as_tibble( rownames = NA)%>% 
+  rownames_to_column("gene")
+
+# Obtain logical vector regarding whether padj values are less than 0.05
+threshold <- results_MUTV1_v_MUTVSB$padj < 0.05
+
+# Add logical vector as a column (threshold) to the res_tableOE
+results_MUTV1_v_MUTVSB$threshold <- threshold
+
+# Create new categorical column ------------------------------------------------
+plot_data <- results_MUTV1_v_MUTVSB %>%
+  mutate(gene_type = case_when(log2FoldChange  > 0 & padj <= 0.05 ~ "up",
+                               log2FoldChange  < 0 & padj <= 0.05 ~ "down",
+                               TRUE ~ "ns"))   
+
+# Count gene_type categories ---------------------------------------------------           
+plot_data %>%
+  dplyr::count(gene_type) %>%
+  knitr::kable()
+
+# |gene_type |     n|
+# |:---------|-----:|
+# |down      |    51|
+# |ns        | 15732|
+# |up        |    42|
+  
+# Check gene_type category names -----------------------------------------------
+plot_data %>%
+  distinct(gene_type) %>%
+  pull()
+#> [1] "down" "up"   "ns"    
+
+# Add colour, size and alpha (transparency) to volcano plot --------------------
+cols <- c("up" = "#D7191C", "down" = "#D7191C", "ns" = "grey90") 
+sizes <- c("up" = 1.75, "down" = 1.75, "ns" = 1.75) 
+alphas <- c("up" = 0.8, "down" = 0.8, "ns" = 0.6)
+
+top_genes <- plot_data %>%
+  arrange(padj) %>%
+  dplyr::filter(!grepl("^Gm|^.*Rik$", gene)) %>%
+  dplyr::filter(!gene_type == "ns") %>%
+  group_by(gene_type) %>%
+  slice_head(n=5)
+
+library(ggrepel)
+
+pdf(file = paste0(params$figure_dir, "VolcanoPlot_MUTV1_v_MUTVSB_v2.pdf"),   # The directory you want to save the file in
+    width = 6, # The width of the plot in inches
+    height = 5) # The height of the plot in inches
+
+plot_data %>%
+  ggplot(aes(x = log2FoldChange, 
+             y = -log10(padj), 
+             color = gene_type, 
+             size = gene_type, 
+             alpha = gene_type)) + 
+  ggrastr::rasterise(geom_point(shape = 19), dpi = 600) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") + 
+  scale_color_manual(values = cols) + # Modify point color
+  scale_size_manual(values = sizes) + # Modify point size
+  scale_alpha_manual(values = alphas) + # Modify point transparency
+  scale_x_continuous(breaks = c(seq(-.5, .5, .25)),  
+                     limits = c(-0.5, 0.5)) +
+  theme_classic() +
+  ylim(0,6) + 
+  geom_text_repel(data = top_genes, 
+                  aes(label = gene), 
+                  size = 4,               # Increase text size
+                  max.overlaps = Inf,     # Ensure no limit on overlaps
+                  segment.color = "grey30",  # Lighter segment color for better visibility
+                  segment.size = 0.5,     # Thinner segments
+                  box.padding = 0.3,      # Add padding around text box
+                  point.padding = 0.5) 
+
+dev.off()
+
+```
+
+#### Table of Differentially Expressed Genes
+
+```{r DGE mut_v1 vs. mut_vsb Volcano plot top hits}
+
+# Set adjusted p-value and log2FC threshold
+padj.cutoff <- 0.05
+lfc.cutoff <- 0
+
+# Filter by the adjusted p-value threshold
+sig <- results_MUTV1_v_MUTVSB %>%
+  dplyr::filter(padj < padj.cutoff &abs(log2FoldChange) > lfc.cutoff) 
+
+# Save results table of significant genes
+write.csv(sig, file=paste0(params$data_dir,"results_MUTV1_v_MUTVSB_sighits.csv"))
+
+# Order significant genes by padj
+sig_ordered = sig[order(sig$padj),] 
+rownames(sig_ordered) <- sig_ordered$gene
+
+# Create data table to display differentially expressed genes 
+datatable(sig_ordered, 
+          extensions = c('KeyTable', "FixedHeader"), 
+          caption = 'Differentially Expressed Genes: MUTVSB vs. WTVSB',
+          options = list(keys = TRUE, searchHighlight = TRUE, pageLength = 10, lengthMenu = c("10", "25", "50", "100"))) %>%
+  formatRound(columns=c(1:4), digits=2)
+
+# Save results table of significant genes ordered by significance
+write.csv(sig, file=paste0(params$data_dir,"results_MUTV1_v_MUTVSB_tophits.csv"))
+
+```
+
+#### Heatmap of all Hits
+
+```{r mut_v1 vs. mut_vsb normalized counts heatmap}
+vsd <- vst(dds, blind = FALSE)
+assay(vsd) <- limma::removeBatchEffect(assay(vsd), batch = vsd$Litter, group = vsd$group)
+vsd_mat <- assay(vsd)
+sig_top <- sig_ordered 
+sig_vsd <- vsd_mat[sig_top$gene,]
+
+### Set annotations
+annotation <- meta %>% 
+  dplyr::select(Group) %>% 
+  data.frame(row.names = IDs)
+
+annotation_colors <- list(Group = c(WTVSB = "black", MUTV1 = "red", MUTVSB = "blue"))
+# All groups
+
+pdf(file = paste0(params$figure_dir, "Heatmap_MUTV1_v_WTV1_allhits_allconditions.pdf"),   # The directory you want to save the file in
+    width = 7, # The width of the plot in inches
+    height = 5) # The height of the plot in inches
+
+pheatmap(sig_vsd,
+         color = scico(palette = "vik", n = 100),
+         cluster_rows = T,
+         cluster_cols = T,
+         annotation_col = annotation, 
+         annotation_colors = annotation_colors ,
+         border_color = NA, 
+         fontsize = 10, 
+         scale = "row", 
+         show_rownames = TRUE,
+         show_colnames = TRUE)
+
+dev.off()
+
+```
+
+#### GO Term Analysis
+
+```{r mut_v1 vs. mut_vsb GO analysis}
+
+# Run clusterProfiler
+## Create background dataset for hypergeometric testing using all genes tested for significance in the results
+all_genes <- as.character(results_MUTV1_v_MUTVSB$gene)
+
+# Make a gene list object
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+mapping <- AnnotationDbi::select(org.Mm.eg.db, keys=all_genes, columns='ENTREZID', keytype='SYMBOL') %>%
+  mutate(gene = SYMBOL)
+
+results_MUTV1_v_MUTVSB <-merge(results_MUTV1_v_MUTVSB , mapping, by = "gene")
+
+# Set adjusted p-value and log2FC threshold
+padj.cutoff <- 0.1
+lfc.cutoff <- 0
+
+# Filter by the adjusted p-value threshold
+sig <- results_MUTV1_v_MUTVSB  %>%
+  dplyr::filter(padj < padj.cutoff &abs(log2FoldChange) > lfc.cutoff) 
+
+sig_top <- sig %>%
+  dplyr::arrange(padj) %>%
+  distinct(ENTREZID,.keep_all = TRUE) 
+
+# we want the log2 fold change 
+gene_list <- sig_top$log2FoldChange
+
+# name the vector
+names(gene_list) <- sig_top$ENTREZID
+
+# omit any NA values 
+gene_list<-na.omit(gene_list)
+
+# sort the list in decreasing order (required for clusterProfiler)
+gene_list = sort(gene_list, decreasing = TRUE)
+
+genes <- names(gene_list)
+gene_names <- sig_top$gene
+
+## Run GO enrichment analysis for all GO terms
+ego <- enrichGO(gene = gene_names, 
+                universe = all_genes,
+                keyType = "SYMBOL",
+                OrgDb = org.Mm.eg.db, 
+                ont = c("ALL"), 
+                pAdjustMethod = "BH", 
+                qvalueCutoff = 0.2, 
+                readable = TRUE)
+
+## Output results from GO analysis to a table
+cluster_summary_go <- data.frame(ego)
+
+
+y <- mutate(ego, richFactor = Count / as.numeric(sub("/\\d+", "", BgRatio)))
+y <- mutate(y, log_padj = -log10(p.adjust))
+y
+
+pdf(file = paste0(params$figure_dir, "GOTerm_MUTV1_v_MUTVSB_lollipop.pdf"),   # The directory you want to save the file in
+    width = 5.5, # The width of the plot in inches
+    height = 5) # The height of the plot in inches
+
+plot_data <- y %>%
+  as_tibble() %>%
+  mutate(Term = gsub(" - Mus musculus \\(house mouse\\)", "",Description))%>%
+  filter(nchar(Term) <= 30) %>%
+  filter(p.adjust < 0.05) %>%
+  filter(!ONTOLOGY == "CC") %>%
+  group_by(ONTOLOGY) %>%
+  slice_head(n=10) %>%
+  ungroup()
+
+ggplot(plot_data, 
+  aes(Count, fct_reorder(Term, Count))) + 
+  geom_segment(aes(xend=0, yend = Term)) +
+  geom_point(aes(size=-log10(p.adjust), color = richFactor)) +
+  scale_color_viridis_b(guide=guide_colorbar(reverse=TRUE)) +
+  scale_size_continuous(range=c(4, 8)) +
+  theme_classic() + 
+  xlab("Gene Count") +
+  ylab(NULL) + 
+  ggtitle("Enriched GO Terms")
+dev.off()
+
+```
+
+### MUT_V1 vs. WT_VSB to look for normalization
+
+```{r DGE mut_v1 vs. wt_vsb}
+
+#Re-level dds object to test effect of treatment
+dds$group <- relevel(dds$group, ref = "WTVSB")
+
+# Define model matrix
+design(dds) <- ~ factor(Litter) + group
+dds <- DESeq(dds)
+results_MUTV1_v_WTVSB <- results(dds,contrast = c("group", "MUTV1", "WTVSB"))
+summary(results_MUTV1_v_WTVSB , alpha = 0.05)
+
+results_MUTV1_v_WTVSB  <- lfcShrink(dds, coef = c("group_MUTV1_vs_WTVSB"), type="normal")
+write.csv(results_MUTV1_v_WTVSB , file=paste0(params$data_dir,"results_MUTV1_v_WTVSB _allhits.csv"))
+
+```
+
+#### Manhattan Plot
+
+```{r DGE mut_v1 vs. wt_vsb MA plot}
+
+plotMA(results_MUTV1_v_WTVSB,
+       alpha = 0.05,
+       main = "Test: p.adj.value < 0.05", ylim = c(-5,5))
+```
+
+#### Volcano Plot
+
+```{r DGE mut_v1 vs. wt_vsbVolcano plot}
+
+results_MUTV1_v_WTVSB  <- results_MUTV1_v_WTVSB  %>%
+  as_tibble( rownames = NA)%>% 
+  rownames_to_column("gene")
+
+# Obtain logical vector regarding whether padj values are less than 0.05
+threshold <- results_MUTV1_v_WTVSB$padj < 0.05
+
+# Add logical vector as a column (threshold) to the res_tableOE
+results_MUTV1_v_WTVSB $threshold <- threshold
+# Create new categorical column ------------------------------------------------
+plot_data <- results_MUTV1_v_WTVSB %>%
+  mutate(gene_type = case_when(log2FoldChange  >= 0.5 & padj <= 0.05 ~ "up",
+                               log2FoldChange  <= -0.5 & padj <= 0.05 ~ "down",
+                               TRUE ~ "ns"))   
+
+# Count gene_type categories ---------------------------------------------------           
+plot_data %>%
+  dplyr::count(gene_type) %>%
+  knitr::kable()
+
+# |gene_type |     n|
+# |:---------|-----:|
+# |down      |   469|
+# |ns        | 15789|
+# |up        |   588|
+  
+# Check gene_type category names -----------------------------------------------
+plot_data %>%
+  distinct(gene_type) %>%
+  pull()
+#> [1] "down" "up"   "ns"    
+
+# Add colour, size and alpha (transparency) to volcano plot --------------------
+cols <- c("up" = "#D7191C", "down" = "#D22B2B", "ns" = "grey90") 
+sizes <- c("up" = 1.75, "down" = 1.75, "ns" = 1.75) 
+alphas <- c("up" = 0.8, "down" = 0.8, "ns" = 0.6)
+
+top_genes <- plot_data %>%
+  arrange(padj) %>%
+  dplyr::filter(!grepl("^Gm|^.*Rik$", gene)) %>%
+  dplyr::filter(!gene_type == "ns") %>%
+  group_by(gene_type) %>%
+  slice_head(n=5)
+
+library(ggrepel)
+
+pdf(file = paste0(params$figure_dir, "VolcanoPlot_MUTV1_v_WTVSB.pdf"),   # The directory you want to save the file in
+    width = 6, # The width of the plot in inches
+    height = 5) # The height of the plot in inches
+plot_data %>%
+  ggplot(aes(x = log2FoldChange, 
+             y = -log10(padj), 
+             color = gene_type, 
+             size = gene_type, 
+             alpha = gene_type)) + 
+  ggrastr::rasterise(geom_point(shape = 19), dpi = 600) +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") + 
+  geom_vline(xintercept = c(-0.5, 0.5),
+             linetype = "dashed") +
+  scale_fill_manual(values = cols) + # Modify point colour
+  scale_size_manual(values = sizes) + # Modify point size
+  scale_alpha_manual(values = alphas)  + # Modify point transparency
+  scale_x_continuous(breaks = c(seq(-3.0, 3.0, 1)),  
+                     limits = c(-3.5, 3.5)) +
+  theme_classic() +
+  ylim(0,275) + 
+  geom_text_repel(data = top_genes, 
+                  aes(label = gene), 
+                  size = 4,               # Increase text size
+                  max.overlaps = Inf,     # Ensure no limit on overlaps
+                  segment.color = "grey30",  # Lighter segment color for better visibility
+                  segment.size = 0.5,     # Thinner segments
+                  box.padding = 0.3,      # Add padding around text box
+                  point.padding = 0.5) 
+
+dev.off()
+```
+
+#### Table of Differentially Expressed Genes
+
+```{r DGE mut_v1 vs. wt_vsb Volcano plot top hits}
+
+# Set adjusted p-value and log2FC threshold
+padj.cutoff <- 0.05
+lfc.cutoff <- 0
+
+genes <- rownames(results_MUTV1_v_WTVSB)
+# Filter by the adjusted p-value threshold
+sig <- results_MUTV1_v_WTVSB  %>%
+  dplyr::filter(padj < padj.cutoff &abs(log2FoldChange) > lfc.cutoff) 
+
+# Save results table of significant genes
+write.csv(sig, file=paste0(params$data_dir,"results_MUTV1_v_WTVSB _sighits.csv"))
+
+# Order significant genes by padj
+sig_ordered = sig[order(sig$padj),] 
+rownames(sig_ordered) <- sig_ordered$gene
+
+# Create data table to display differentially expressed genes 
+datatable(sig_ordered, 
+          extensions = c('KeyTable', "FixedHeader"), 
+          caption = 'Differentially Expressed Genes: MUTV1 vs. WTVSB',
+          options = list(keys = TRUE, searchHighlight = TRUE, pageLength = 10, lengthMenu = c("10", "25", "50", "100"))) %>%
+  formatRound(columns=c(1:4), digits=2)
+
+# Save results table of significant genes ordered by significance
+write.csv(sig, file=paste0(params$data_dir,"results_MUTV1_v_WTVSB _tophits.csv"))
+
+```
+
+#### Do we see normalized gene expression?
+
+```{r DEG mut_v1 vs. wt_vsb normalization}
+# Read in genotype specific significant hits
+sig_MUTVSB_v_WTVSB <- read.csv(file=paste0(params$data_dir,"results_MUTVSB_v_WTVSB_sighits.csv"))%>%
+  as.data.frame() %>%
+  dplyr::filter(abs(log2FoldChange) > 0.5)
+results_MUTV1_v_WTVSB <- read_csv("data/results_MUTV1_v_WTVSB _allhits.csv") %>%
+  as.data.frame() %>%
+  dplyr::rename(gene = ...1)
+
+normalized <- results_MUTV1_v_WTVSB %>%
+  dplyr::filter(gene %in% sig_MUTVSB_v_WTVSB$gene) %>%
+  dplyr::filter(padj > 0.05 | abs(log2FoldChange) < 0.5)
+
+# Create table of normalized genes 
+
+normalized_stats <- normalized %>%
+  dplyr::select(gene, log2FoldChange, padj) %>%
+  dplyr::rename(log2FoldChange_miAtxn2vWT=log2FoldChange) %>%
+  dplyr::rename(padj_miAtxn2vWT=padj)
+
+mutant_stats  <- results_MUTVSB_v_WTVSB %>%
+  dplyr::select(gene, log2FoldChange, padj) %>%
+  dplyr::rename(log2FoldChange_MUTvWT=log2FoldChange) %>%
+  dplyr::rename(padj_MUTvWT=padj)
+
+miAtxn2_NormalizedGeneExpression_table <- left_join(normalized_stats,mutant_stats) %>%
+  dplyr::mutate(deltaLog2FoldChange = log2FoldChange_miAtxn2vWT - log2FoldChange_MUTvWT) %>%
+  dplyr::mutate("abs(deltaLog2FoldChange)" = abs(deltaLog2FoldChange)) %>%
+  dplyr::arrange(desc(abs(deltaLog2FoldChange))) %>%
+  drop_na()
+
+View(miAtxn2_NormalizedGeneExpression_table )
+
+write.csv(miAtxn2_NormalizedGeneExpression_table, file=paste0(params$data_dir,"miAtxn2_NormalizedGeneExpression_table.csv"))
+```
+
+#### Volcano Plot of Gene Normalization
+
+```{r normalized volcano plot}
+sig_MUTV1_v_WTVSB <- read_csv("data/results_MUTV1_v_WTVSB _allhits.csv") %>%
+  dplyr::rename(gene = "...1")
+
+# Make a results table of the DEGs between MUTV1 and WTVSB and filter by genes that were significantly dyregulated in the mutant mice vs. wt
+  results_table_tb <- sig_MUTV1_v_WTVSB %>%
+    dplyr::filter(gene %in% sig_MUTVSB_v_WTVSB$gene) %>%
+    dplyr::arrange(padj)
+
+
+  # Create new categorical column ------------------------------------------------
+samples <- results_table_tb  %>%
+  mutate(gene_type = case_when(log2FoldChange  >= 0.5 & padj <= 0.05 ~ "up",
+                               log2FoldChange  <= -0.5 & padj <= 0.05 ~ "down",
+                               TRUE ~ "ns"))   
+samples$padj <- pmax(samples$padj, 1e-150)
+samples$log2FoldChange <- pmin(samples$log2FoldChange, 2.5)
+samples$log2FoldChange <- pmax(samples$log2FoldChange, -2.5)
+# Count gene_type categories ---------------------------------------------------           
+samples %>%
+  dplyr::count(gene_type) %>%
+  knitr::kable()
+
+# |gene_type |   n|
+# |:---------|---:|
+# |down      | 376|
+# |ns        | 452|
+# |up        | 460|
+  
+# Check gene_type category names -----------------------------------------------
+samples %>%
+  distinct(gene_type) %>%
+  pull()
+#> [1] "down" "up"   "ns"    
+
+# Add colour, size and alpha (transparency) to volcano plot --------------------
+cols <- c("up" = "#D22B2B", "down" = "#D22B2B", "ns" = "darkblue") 
+sizes <- c("up" = 1.75, "down" = 1.75, "ns" = 1.75) 
+alphas <- c("up" = 0.6, "down" = 0.6, "ns" = 0.4)
+
+library(ggrepel)
+
+pdf(file = paste0(params$figure_dir, "VolcanoPlot_MUTV1_v_WTVSB_normalized.pdf"),   # The directory you want to save the file in
+    width = 4, # The width of the plot in inches
+    height = 4) # The height of the plot in inches
+samples  %>%
+  ggplot(aes(x = log2FoldChange, 
+             y = -log10(padj), 
+             color = gene_type, 
+             size = gene_type, 
+             alpha = gene_type)) + 
+  ggrastr::rasterise(geom_point(shape = 19), dpi = 600) + 
+  geom_hline(yintercept = -log10(0.001), linetype = "dashed") + 
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+  scale_color_manual(values = cols) + # Modify point color
+  scale_size_manual(values = sizes) + # Modify point size
+  scale_alpha_manual(values = alphas) + # Modify point transparency
+  scale_x_continuous(breaks = c(seq(-2.0, 2.0, 1)), limits = c(-2, 2.5)) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  ylim(0, 150) 
+dev.off()
+
+
+```
+
+#### Heatmap of Normalized Hits
+
+```{r mut_v1 vs. mut_vsb normalized counts heatmap}
+vsd <- vst(dds, blind = TRUE)
+assay(vsd) <- limma::removeBatchEffect(assay(vsd), batch = vsd$Litter, group = vsd$group)
+vsd_mat <- assay(vsd)
+normalized <- miAtxn2_NormalizedGeneExpression_table 
+
+sig_vsd <- vsd_mat[normalized$gene,]
+
+### Set annotations
+annotation <- meta %>% 
+  dplyr::select(Group) %>% 
+  data.frame(row.names = IDs)
+
+annotation_colors <- list(Group = c(WTVSB = "black", MUTV1 = "red", MUTVSB = "blue"))
+# All groups
+
+pdf(file = paste0(params$figure_dir, "Heatmap_normalized_tophits_allconditions.pdf"),   # The directory you want to save the file in
+    width = 7, # The width of the plot in inches
+    height = 5) # The height of the plot in inches
+
+pheatmap(sig_vsd,
+         color = scico(palette = "vik", n = 100),
+         cluster_rows = T,
+         cluster_cols = T,
+         annotation_col = annotation, 
+         annotation_colors = annotation_colors ,
+         border_color = NA, 
+         fontsize = 10, 
+         scale = "row", 
+         height = 20,
+         show_rownames = TRUE,
+         show_colnames = FALSE)
+
+dev.off()
+
+vsd <- vst(dds, blind = TRUE)
+assay(vsd) <- limma::removeBatchEffect(assay(vsd), batch = vsd$Batch, group = vsd$group)
+vsd_mat <- assay(vsd)
+normalized <- miAtxn2_NormalizedGeneExpression_table %>%
+  dplyr::filter(padj_miAtxn2vWT > 0.05) %>%
+  dplyr::filter(abs(log2FoldChange_miAtxn2vWT) < 0.5) %>%
+  arrange(deltaLog2FoldChange)
+
+sig_vsd <- vsd_mat[normalized$gene,]
+
+### Set annotations
+annotation <- meta %>% 
+  dplyr::select(Group) %>% 
+  data.frame(row.names = IDs)
+
+annotation_colors <- list(Group = c(WTVSB = "black", MUTV1 = "red", MUTVSB = "blue"))
+# All groups
+
+pdf(file = paste0(params$figure_dir, "Heatmap_normalized_pvaluetop_hits_allconditions.pdf"),   # The directory you want to save the file in
+    width = 5, # The width of the plot in inches
+    height = 10) # The height of the plot in inches
+
+pheatmap(sig_vsd,
+         color = scico(palette = "vik", n = 100),
+         cluster_rows = T,
+         cluster_cols = T,
+         annotation_col = annotation, 
+         annotation_colors = annotation_colors ,
+         border_color = NA, 
+         fontsize = 10, 
+         scale = "row", 
+         height = 20,
+         show_rownames = TRUE,
+         show_colnames = FALSE)
+
+dev.off()
+
+
+```
+
+#### GO Term Analysis
+
+```{r mut_vsb vs. wt_vsb GO analysis}
+results_MUTV1_v_WTVSB <- read_csv("data/results_MUTV1_v_WTVSB _allhits.csv") %>%
+  dplyr::rename(gene = "...1")
+
+# Run clusterProfiler
+## Create background dataset for hypergeometric testing using all genes tested for significance in the results
+all_genes <- as.character(results_MUTVSB_v_WTVSB$gene)
+
+# Make a gene list object
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+mapping <- AnnotationDbi::select(org.Mm.eg.db, keys=all_genes, columns='ENTREZID', keytype='SYMBOL') %>%
+  mutate(gene = SYMBOL)
+
+normalized <-merge( miAtxn2_NormalizedGeneExpression_table  , mapping, by = "gene")
+
+## Select only all significant genes with log2FC > |0.5| and top 1000 by p adjusted 
+normalized <- normalized%>%
+  distinct(ENTREZID,.keep_all = TRUE) 
+
+## Run GO enrichment analysis for all GO terms
+ego <- enrichGO(gene =normalized$gene, 
+                keyType = "SYMBOL",
+                OrgDb = org.Mm.eg.db, 
+                ont = c("ALL"), 
+                pAdjustMethod = "BH", 
+                pvalueCutoff = 0.2,
+                qvalueCutoff = 0.2, 
+                readable = TRUE)
+
+
+## Output results from GO analysis to a table
+ego <- simplify(ego)
+cluster_summary_go <- data.frame(ego)
+
+
+y <- mutate(ego, richFactor = Count / as.numeric(sub("/\\d+", "", BgRatio)))
+y <- mutate(y, log_padj = -log10(p.adjust))
+y
+
+pdf(file = paste0(params$figure_dir, "GOTerms_normalized_lollipop.pdf"),   # The directory you want to save the file in
+    width = 5.5, # The width of the plot in inches
+    height = 5) # The height of the plot in inches
+
+plot_data <- y %>%
+  as_tibble() %>%
+  mutate(Term = gsub(" - Mus musculus \\(house mouse\\)", "",Description))%>%
+  filter(nchar(Term) <= 25) %>%
+  filter(p.adjust < 0.05) %>%
+  filter(!ONTOLOGY == "CC") %>%
+  arrange(desc(Count),p.adjust) %>%
+  slice_head(n=15)
+ggplot(plot_data, showCategory = 10, 
+  aes(Count, fct_reorder(Term, Count))) + 
+  geom_segment(aes(xend=0, yend = Term)) +
+  geom_point(aes(size=log_padj, color = richFactor)) +
+  scale_color_viridis_b(guide=guide_colorbar(reverse=TRUE)) +
+  scale_size_continuous(range=c(4, 8)) +
+  theme_classic() + 
+  xlab("Gene Count") +
+  ylab(NULL) + 
+  ggtitle("Enriched GO Terms")
+dev.off()
+
+write.csv(cluster_summary_kegg, file = "cluster_summary_kegg.csv")
+```
+
+# Scatterplot of effect size
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrastr)
+
+# Step 1: Read the data and add significance columns
+sig_MUTVSB_v_WTVSB <- read.csv(file=paste0(params$data_dir,"results_MUTVSB_v_WTVSB _allhits.csv")) %>%
+  dplyr::rename(gene = X) %>%
+  mutate(significant_VSB = pvalue < 0.05 & abs(log2FoldChange ) > 0.5)
+
+sig_MUTV1_v_WTVSB <- read.csv(file=paste0(params$data_dir,"results_MUTV1_v_WTVSB _allhits.csv")) %>%
+  dplyr::rename(gene = X) %>%
+  mutate(significant_V1 = pvalue < 0.05 & abs(log2FoldChange ) > 0.5)
+
+# Step 2: Get normalized genes
+
+sig_MUTV1_v_WTVSB_norm <- sig_MUTV1_v_WTVSB  %>%
+  dplyr::filter(!gene %in% sig_MUTVSB_v_WTVSB$gene) 
+plot <- merge(sig_MUTVSB_v_WTVSB, sig_MUTV1_v_WTVSB, by = "gene", suffixes = c("VSB", "V1"))
+
+# Step 3: Create a combined significance column
+plot <- plot %>%
+  mutate(significance = case_when(
+    significant_VSB & significant_V1 ~ "Both",
+    significant_VSB ~ "VSB",
+    significant_V1 ~ "V1",
+    TRUE ~ "None"
+  )) 
+pearson_coef <- cor(plot$log2FoldChangeVSB, plot$log2FoldChangeV1, method = "pearson")
+
+# Step 4: Plot with colors
+
+pdf(file = paste0(params$figure_dir, "V1_vs_VSB_effectsize.pdf"),   # The directory you want to save the file in
+    width = 6, # The width of the plot in inches
+    height = 6) # The height of the plot in inches
+ggplot(plot, aes(x = log2FoldChangeVSB, y = log2FoldChangeV1, color = significance)) +
+  ggrastr::rasterise(geom_point(size = 0.2), dpi = 100) +  # Rasterize this layer
+  theme_classic() +
+  theme(text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_blank(),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5)) +
+  lims(x = c(-3.5, 3.5), y = c(-3.5, 3.5)) + 
+  coord_equal() + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Both" = "black", "VSB" = "blue", "V1" = "red", "None" = "grey90")) +
+  coord_equal() + 
+  geom_hline(yintercept = c(-0.5, 0.5), linetype = "dashed") + 
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+  geom_smooth(method = "lm", color = "black", se = FALSE) +  # Add linear regression line
+  annotate("text", x = -3, y = 3, label = paste("R =", round(pearson_coef, 2)), size = 5, hjust = 0)
+
+
+dev.off()
+
+
+```
+
+## Venn Diagram Overlap
+
+```{r venn overlap}
+# load package
+library(VennDiagram)
+
+# Prepare character vectors
+v1 <-as.data.frame(read_csv("data/results_MUTVSB_v_WTVSB_sighits.csv"))
+
+v1 <- v1 %>% 
+  dplyr::filter(abs(log2FoldChange) > 0.5) %>%
+  pull(gene)
+
+v2 <-as.data.frame(read_csv("data/results_MUTV1_v_WTVSB _sighits.csv"))
+
+v2 <- v2 %>% 
+  dplyr::filter(abs(log2FoldChange) > 0.5) %>%
+  pull(gene)
+
+v3 <-as.data.frame(read_csv("data/results_MUTV1_v_MUTVSB_sighits.csv"))
+
+v3 <- v3 %>% 
+  pull(gene)
+
+
+# Create a list of vectors
+vlist <- list(v1, v2,v3)
+names(vlist) <- c("MUTVSB_v_WTVSB", "MUTV1_v_WTVSB", "MUTV1_v_MUTVSB")
+
+# 2-way Venn
+venn.diagram(vlist[c(1:2)], 
+    filename="Venn_2way.tiff",
+    imagetype="tiff")
+
+
+pdf(file = paste0(params$figure_dir, "tardbp1.pdf"),   # The directory you want to save the file in
+    width = 3, # The width of the plot in inches
+    height = 2.5) # The height of the plot in inches
+
+goi <- c("Tardbp")
+
+
+tcounts <- t(log2((counts(dds[goi, ], normalized=TRUE, replaced=FALSE)+.5))) %>%
+  merge(colData(dds), ., by="row.names") %>%
+  gather(gene, expression, (ncol(.)-length(goi)+1):ncol(.))
+
+tcounts$group <- factor(tcounts$group, levels = c("WTVSB", "MUTVSB", "MUTV1")) 
+
+ggplot(tcounts, aes(group, expression, color=group)) + 
+  geom_boxplot(outliers = FALSE) + 
+  geom_point(size = 1, shape = 21) + 
+  facet_wrap(~gene, scales="free") + 
+  scale_color_manual(values = c("WTVSB" = "black", "MUTVSB" = "blue", "MUTV1" = "red")) +
+  labs(y="Expression (normalized counts)") + 
+  theme_classic()
+dev.off()
+
+
+
+pdf(file = paste0(params$figure_dir, "miAtxn2_vs_mutant_tophits.pdf"),   # The directory you want to save the file in
+    width = 4.5, # The width of the plot in inches
+    height = 3) # The height of the plot in inches
+
+goi <- c("Hist2h2aa1", "Tmem144", "Idh3a", "Zfand3", "Fam107a", "Vegfa", "Cryab")
+
+
+tcounts <- t(log2((counts(dds[goi, ], normalized=TRUE, replaced=FALSE)+.5))) %>%
+  merge(colData(dds), ., by="row.names") %>%
+  gather(gene, expression, (ncol(.)-length(goi)+1):ncol(.))
+
+tcounts$group <- factor(tcounts$group, levels = c("WTVSB", "MUTVSB", "MUTV1")) 
+
+ggplot(tcounts, aes(group, expression, color=group)) + 
+  geom_boxplot(outliers = FALSE) + 
+  geom_point(size = 1, shape = 21) + 
+  facet_wrap(~gene, scales="free") + 
+  scale_color_manual(values = c("WTVSB" = "black", "MUTVSB" = "blue", "MUTV1" = "red")) +
+  labs(y="Expression (normalized counts)") + 
+  theme_classic()
+dev.off()
+
+pdf(file = paste0(params$figure_dir, "miAtxn2_vs_mutant_tophits.pdf"),   # The directory you want to save the file in
+    width = 4.5, # The width of the plot in inches
+    height = 3) # The height of the plot in inches
+
+goi <- c("Tubb2b", "Dbr1", "Cryab", "Vegfa", "Fam107a","Crebrf")
+
+
+tcounts <- t(log2((counts(dds[goi, ], normalized=TRUE, replaced=FALSE)+.5))) %>%
+  merge(colData(dds), ., by="row.names") %>%
+  gather(gene, expression, (ncol(.)-length(goi)+1):ncol(.))
+
+tcounts$group <- factor(tcounts$group, levels = c("WTVSB", "MUTVSB", "MUTV1")) 
+
+ggplot(tcounts, aes(group, expression, color=group)) + 
+  geom_boxplot(outliers = FALSE) + 
+  geom_point(size = 1, shape = 21) + 
+  facet_wrap(~gene, scales="free") + 
+  scale_color_manual(values = c("WTVSB" = "black", "MUTVSB" = "blue", "MUTV1" = "red")) +
+  labs(y="Expression (normalized counts)") + 
+  theme_classic()
+dev.off()
+
+
+pdf(file = paste0(params$figure_dir, "miAtxn2_normalized_tophits.pdf"),   # The directory you want to save the file in
+    width = 4.5, # The width of the plot in inches
+    height = 3) # The height of the plot in inches
+
+goi <- c("Hist2h2aa1", "Tmem144", "Trpc6", "Idh3a","Fbln5","Lmbrd2", "Itga10")
+
+goi <- "Tuba1a"
+tcounts <- t(log2((counts(dds[goi, ], normalized=TRUE, replaced=FALSE)+.5))) %>%
+  merge(colData(dds), ., by="row.names") %>%
+  gather(gene, expression, (ncol(.)-length(goi)+1):ncol(.))
+
+tcounts$group <- factor(tcounts$group, levels = c("WTVSB", "MUTVSB", "MUTV1")) 
+
+ggplot(tcounts, aes(group, expression, color=group)) + 
+  geom_boxplot(outliers = FALSE) + 
+  geom_point(size = 1, shape = 21) + 
+  facet_wrap(~gene, scales="free") + 
+  scale_color_manual(values = c("WTVSB" = "black", "MUTVSB" = "blue", "MUTV1" = "red")) +
+  labs(y="Expression (normalized counts)") + 
+  theme_classic()
+dev.off()
+
+
+```
+
+## Supplementary Table 1
+```{r}
+
+# Read in genotype specific significant hits
+sig_MUTVSB_v_WTVSB <- read.csv(file=paste0(params$data_dir,"results_MUTVSB_v_WTVSB_sighits.csv"))%>%
+  as.data.frame() %>%
+  dplyr::filter(abs(log2FoldChange) > 0.5)
+
+results_MUTV1_v_WTVSB <- read_csv("data/results_MUTV1_v_WTVSB _allhits.csv") %>%
+  as.data.frame() %>%
+  dplyr::rename(gene = ...1)
+
+results_MUTV1_v_MUTVSB_genes <-as.data.frame(read_csv("data/results_MUTV1_v_MUTVSB_sighits.csv")) %>% 
+  pull(gene)
+
+gene_table <- results_MUTV1_v_WTVSB %>%
+  dplyr::filter(gene %in% sig_MUTVSB_v_WTVSB$gene) %>%
+  dplyr::filter(gene %in% results_MUTV1_v_MUTVSB_genes)
+
+# Create table of normalized genes 
+
+normalized_stats <- gene_table %>%
+  dplyr::select(gene, log2FoldChange, padj) %>%
+  dplyr::rename(log2FoldChange_miAtxn2vWT=log2FoldChange) %>%
+  dplyr::rename(padj_miAtxn2vWT=padj)
+
+mutant_stats  <- results_MUTVSB_v_WTVSB %>%
+  dplyr::select(gene, log2FoldChange, padj) %>%
+  dplyr::rename(log2FoldChange_MUTvWT=log2FoldChange) %>%
+  dplyr::rename(padj_MUTvWT=padj)
+
+miAtxn2_NormalizedGeneExpression_table <- left_join(normalized_stats,mutant_stats) %>%
+  dplyr::mutate(deltaLog2FoldChange = log2FoldChange_miAtxn2vWT - log2FoldChange_MUTvWT) %>%
+  dplyr::mutate("abs(deltaLog2FoldChange)" = abs(deltaLog2FoldChange)) %>%
+  dplyr::arrange(desc(abs(deltaLog2FoldChange))) %>%
+  drop_na()
+
+View(miAtxn2_NormalizedGeneExpression_table )
+
+write.csv(miAtxn2_NormalizedGeneExpression_table, file=paste0(params$data_dir,"miAtxn2_NormalizedGeneExpression_table_forpublication.csv"))
+
+```
+
